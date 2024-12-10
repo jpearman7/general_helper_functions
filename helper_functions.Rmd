@@ -1,0 +1,289 @@
+---
+title: "Data Processing Functions"
+author: "Josh Pearman"
+date: "2024-12-10"
+output: html_document
+---
+
+Below is a collection of data processing and cleaning functions for data types I often work with, ranging from managing time variables, expanding survey-based network items stored in a concatenated list into a full column, and working with bibliometric scientific data. I'll return to this at some point in the future for documentation and refactoring, and maybe add some examples. I'll also have to rework the functions so that variables are set as parameters, since right now they're built into the functions themselves for my specific use-cases.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Network analysis data
+
+These functions are designed to standardize network items commonly administered on Qualtrics or other survey websites. For example, if you ask 5 people to rate their team members and the data is stored in a concatenated list (e.g., "5, 4, 2"), these functions will expand that to make it easier for extracting an adjacency matrix.
+
+```{r network}
+# Standardize network items into list format
+process_column <- function(column) {
+  sapply(column, function(cell) {
+    if (grepl("^c\\(", cell)) {
+      # If the cell starts with 'c(', it's likely a concatenated list
+      numbers <- eval(parse(text = cell))
+      paste(numbers, collapse = ", ")
+    } else {
+      # If not, return the original value
+      cell
+    }
+  })
+}
+# Customizable function for using process_column function on network items by suffix
+process_network_columns <- function(df) {
+  # Get all column names
+  all_cols <- names(df)
+  
+  # Find columns ending with "LIMIT_1"
+  limit_1_cols <- all_cols[endsWith(all_cols, "LIMIT_1")]
+  
+  # Process each LIMIT_1 column
+  for (col in limit_1_cols) {
+    df[[col]] <- process_column(df[[col]])
+  }
+  
+  return(df)
+}
+
+# Turn network items into matrix format
+expand_column <- function(df, column_name, new_col_prefix, maxcol) {
+  # Create a matrix to store the expanded column values
+  expanded_values <- matrix(0, nrow = nrow(df), ncol = maxcol)
+  maxcol_name <- maxcol-1
+  # Loop through each row of your data frame and fill in the appropriate values in expanded_values
+  for (i in 1:nrow(df)) {
+    column_values <- strsplit(as.character(df[[column_name]][i]), ",")[[1]]
+    for (j in 1:length(column_values)) {
+      expanded_values[i, as.numeric(column_values[j])] <- 1
+    }
+  }
+  
+  # Add the expanded columns to your data frame with the given prefix
+  new_colnames <- paste0(new_col_prefix, "_", 1:maxcol)
+  df <- cbind(df, expanded_values)
+  names(df)[(ncol(df)-maxcol_name):ncol(df)] <- new_colnames
+  
+  # Return the updated data frame
+  return(df)
+}
+
+
+```
+
+# Time functions
+
+These are functions for various time-related purposes, such as splitting time data into different buckets, pivoting time data from long to wide for time-series analysis, and generating new columns backwards or forwards based on an input time (which helps if you're trying to create a standardized time dataframe across multiple experiments that occurred at different days and times)
+
+```{r time}
+# Function to extract times and create 10min, 20min, and 30min labels
+extract_times <- function(input_time) {
+  # Parse input_time into a POSIXct object
+  input_time <- strptime(input_time, format = "%H:%M")
+  
+  # Calculate start time, 10 min, 20 min, and 30 min after start
+  start_time <- input_time - minutes(45)
+  time_10min <- start_time + minutes(10)
+  time_20min <- start_time + minutes(20)
+  time_30min <- start_time + minutes(30)
+  
+  # Create a data frame with SurveyTime and Time columns
+  result <- data.frame(
+    SurveyTime = c(time_10min, time_20min, time_30min),
+    Time = c(10, 20, 30)
+  )
+  
+  # Format SurveyTime as HH:MM
+  result$SurveyTime <- format(result$SurveyTime, format = "%H:%M")
+  
+  return(result)
+}
+
+# Function to compare times and update Time column
+update_time_column <- function(df, survey_times, range_var) {
+  # Convert hm_time to POSIXct format
+  df$hm_time <- strptime(df$hm_time, format = "%H:%M")
+  survey_times$SurveyTime <- strptime(survey_times$SurveyTime, format = "%H:%M")
+  
+  # Initialize an empty vector to store updated Time values
+  updated_times <- numeric(nrow(df))
+  
+  # Iterate through each row in the dataframe
+  for (i in 1:nrow(df)) {
+    # Get the HM_time from the dataframe
+    hm_time <- df$hm_time[i]
+    
+    # Calculate time differences between hm_time and SurveyTime values
+    time_diffs <- as.numeric(difftime(hm_time, survey_times$SurveyTime, units = "mins"))
+    
+    # Find the index of the closest SurveyTime within 10 minutes
+    closest_index <- which(time_diffs < range_var)
+    
+    # If a matching SurveyTime within 10 minutes is found, update Time column
+    if (length(closest_index) > 0) {
+      updated_times[i] <- survey_times$Time[closest_index[1]]
+    } else {
+      updated_times[i] <- NA  # Set Time to NA if no match is found within 10 minutes
+    }
+  }
+  
+  # Update the df$Time column with the matched Time values
+  df$Time <- updated_times
+  
+  return(df)
+}
+
+# Function version of code to pivot data using time
+
+time_wide <- function(df) {
+  df <- df %>%
+    # Create time variable
+    mutate(time = format(as.POSIXct(creationDateTime), format = "%H:%M:%S")) %>%
+    # Remove deletion coordinate behaviors
+    filter(type != "DELETEMAPCELL" & type != "DELETESAVEDCALCULATION") %>% 
+    # Sort by time variable so indexing is correct
+    arrange(time)
+  # Create index var
+  df$index <- 1:nrow(df)
+  df <- df %>% 
+    # Sort downwards by index so that last-selected coordinates are first
+    arrange(desc(index)) %>% 
+    # Only retain distinct coordinates by sender
+    # Specifically retains last-selected coordinates
+    distinct(sender, time, .keep_all = TRUE) %>%
+    # Remove index variable
+    select(-c(index)) %>% 
+    # Rearrange chronologically
+    arrange(time)
+  
+  # Pivot wider by time variable
+  wide_df <- df %>%
+    pivot_wider(
+      id_cols = c("campaign", "mission", "session", "sender"),
+      names_from = time,
+      values_from = coordinate
+    )
+  return(wide_df)
+}
+
+## Function to take input start time and generate an empty dataframe with one second
+## per column for 45 minutes, or 2700 columns.
+
+time_gen_forward <- function(start_time) {
+  convert_time <- strptime(start_time, format = "%H:%M:%S")
+  time_vector <- seq(convert_time, by = "1 sec", length.out = 2700)
+  
+  time_vector <- format(time_vector,"%H:%M:%S")
+  
+  df <- data.frame(matrix(ncol = length(time_vector) + 4, nrow = 0))
+  colnames(df) <- c("campaign", "mission", "session", "sender", as.character(time_vector))
+  
+  return(df)
+}
+
+## Function to take input end time and generate an empty dataframe with one second
+## per column for 45 minutes, or 2700 columns.
+
+time_gen_backward <- function(end_time) {
+  convert_time <- strptime(end_time, format = "%H:%M:%S") - as.difftime(2700, unit = "secs")
+  time_vector <- seq(convert_time, by = "1 sec", length.out = 2700)
+  
+  time_vector <- format(time_vector,"%H:%M:%S")
+  
+  df <- data.frame(matrix(ncol = length(time_vector) + 4, nrow = 0))
+  colnames(df) <- c("campaign", "mission", "session", "sender", as.character(time_vector))
+  
+  return(df)
+}
+
+## Function to merge time name column with the wide format dataframe
+
+merge_times <- function(df_time, wide_df) {
+  df <- data.frame(matrix(ncol = ncol(df_time), nrow = nrow(wide_df)))
+  colnames(df) <- colnames(df_time)
+  
+  for (col in colnames(wide_df)) {
+    if (col %in% colnames(df)) {
+      df[[col]] <- wide_df[[col]]
+    } else {
+      df[[col]] <- NA
+    }
+  }
+  
+  df[df == "NULL"] <- NA
+  
+  # This keeps only up to the 45th minute (or 2700th second) of a session.
+  # Specifically, use the MTS signoff time and then generate 2700 seconds backwards from there
+  # to determine start time
+  df <- df[,c(1:2704)] 
+  
+  return(df)
+}
+
+
+```
+
+# Text formatting code
+
+Here are some functions that I use to extract variable names and item content from a standard Qualtrics survey (in case you want to analyze items directly), a function for fuzzy matching between two string columns (useful when trying to compare all the different names one university might go by), and a function for extracting the first and last authors of a paper that is flexible across team size.
+
+```{r text-cleaning}
+# Function to clean the text from Qualtrics items
+clean_text <- function(text) {
+  # Remove everything up to and including the dash and space after it
+  cleaned <- sub("^.*- ", "", text)
+  return(cleaned)
+}
+
+# Function to find and replace item labels with texts
+replace_with_text <- function(keys, texts) {
+  match_col <- which(names(texts) == keys)
+  if (length(match_col) > 0) {
+    return(texts[1, match_col])  # Assuming the text is in the first row
+  } else {
+    return(keys)  # Return original value if no match found
+  }
+}
+
+# Fuzzy string matching functions
+# Function for fuzzy string matching of university names
+standardize_name <- function(x) {
+  str_to_lower(x) %>%
+    # Remove common separators
+    str_replace_all("[,\\-\\_]", " ") %>%
+    # Remove multiple spaces
+    str_replace_all("\\s+", " ") %>%
+    str_trim()
+}
+
+# Function to identify first and last authors in a bibliometric dataset
+identify_first_last <- function(df) {
+  # Split coauthor names by semicolon (;)
+  coauthors <- strsplit(df$coauthor_names, ";")
+  
+  # Iterate over each row
+  for (i in 1:nrow(df)) {
+    # Split the coauthors for the current row by comma (,)
+    names <- strsplit(coauthors[[i]], ",")
+    
+    # Trim leading/trailing whitespace for each name
+    names <- lapply(names, trimws)
+    
+    # Check if the first name matches the firstname column
+    if (names[[1]][1] == df$last_name[i] & names[[1]][2] == df$first_name[i]) {
+      df$authorship_order[i] <- "first"
+    }
+    
+    # Check if the last name matches the lastname column
+    else if (names[[length(names)]][1] == df$last_name[i] & names[[length(names)]][2] == df$first_name[i]) {
+      df$authorship_order[i] <- "last"
+    }
+    
+    else{
+      df$authorship_order[i] <- "middle"
+    }
+  }
+  return(df)
+}
+```
+
